@@ -1,0 +1,96 @@
+## The Problem
+
+Every DSA tracking tool I tried was either too simple (a spreadsheet) or too opaque (LeetCode's built-in tracking). I wanted something that modeled the actual structure of how I study: organized by sheets, broken into sections, with individual problem progress.
+
+## Architecture Decisions
+
+The core insight was treating the data as a **relational hierarchy**:
+
+```
+Sheet → Section → Problem
+```
+
+Each sheet (like "Striver's SDE Sheet") contains sections ("Arrays", "Linked Lists"), and each section contains problems with individual progress tracking.
+
+### Why Relational?
+
+A document-based approach would have been simpler upfront, but relational modeling gave me:
+
+- **Referential integrity** — a problem can't exist without a section
+- **Efficient queries** — fetch all problems in a section without loading the entire sheet
+- **Atomic updates** — progress changes are transactional
+
+## Data Modeling
+
+The Prisma schema captures the hierarchy:
+
+```typescript
+model Sheet {
+  id       String    @id @default(cuid())
+  title    String
+  sections Section[]
+}
+
+model Section {
+  id       String    @id @default(cuid())
+  title    String
+  sheetId  String
+  sheet    Sheet     @relation(fields: [sheetId], references: [id])
+  problems Problem[]
+}
+
+model Problem {
+  id        String  @id @default(cuid())
+  title     String
+  link      String
+  sectionId String
+  section   Section @relation(fields: [sectionId], references: [id])
+  status    String  @default("pending")
+  notes     String?
+}
+```
+
+## Handling Nested Transactions
+
+The hardest part was **bulk progress updates**. When marking an entire section as complete, I needed to:
+
+1. Update every problem's status
+2. Recalculate section completion percentage
+3. Recalculate sheet completion percentage
+
+All atomically. Prisma's `$transaction` API handled this cleanly:
+
+```typescript
+await prisma.$transaction(async (tx) => {
+  await tx.problem.updateMany({
+    where: { sectionId },
+    data: { status: "completed" },
+  });
+
+  // Recalculate derived state within the same transaction
+  const total = await tx.problem.count({ where: { sectionId } });
+  const completed = await tx.problem.count({
+    where: { sectionId, status: "completed" },
+  });
+
+  await tx.section.update({
+    where: { id: sectionId },
+    data: { progress: completed / total },
+  });
+});
+```
+
+## Deployment Challenges
+
+Deploying to Vercel with a PostgreSQL database surfaced real production issues:
+
+- **Cold starts**: Serverless functions had variable connection times. Connection pooling via Prisma Accelerate helped.
+- **Migration safety**: Running `prisma migrate deploy` in CI required careful ordering — schema changes before code deployment.
+- **Edge cases**: What happens when a user deletes a sheet that has in-progress problems? Cascade deletes needed explicit configuration.
+
+## Lessons Learned
+
+1. **Start with the data model.** The UI follows naturally from well-structured data.
+2. **Transactions aren't optional.** Any operation touching multiple tables needs atomicity.
+3. **Deploy early.** Local development hides real infrastructure issues.
+4. **Optimize later.** I started with simple queries and only added indices after measuring.

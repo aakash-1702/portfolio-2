@@ -1,0 +1,482 @@
+## Who this is for
+
+This blog is for developers who want to understand what actually goes into building a competitive programming judge — not the theory version you find in system design interviews, but the real version with actual infrastructure decisions, real failure modes, and honest tradeoffs.
+
+I built BaseCase as my BTech major project. This is everything I learned doing it.
+
+---
+
+## The deceptive simplicity of "run code and show output"
+
+When you click Run on LeetCode, it looks simple. You typed some code. A second later you see output. What happened in between?
+
+At minimum, something needs to:
+
+1. Receive your source code over HTTP
+2. Compile it (for compiled languages)
+3. Execute it in a sandboxed environment
+4. Pipe stdin to the process
+5. Capture stdout and stderr
+6. Kill it if it takes too long or uses too much memory
+7. Return the result
+
+Each of those seven steps has real complexity hiding inside it. Step 3 alone — "sandboxed environment" — is an entire subdomain of systems programming involving Linux namespaces, cgroups, seccomp filters, and chroot jails.
+
+The good news: you don't have to build any of that yourself. Judge0 exists.
+
+The bad news: running Judge0 correctly has its own learning curve.
+
+---
+
+## What Judge0 actually is
+
+Judge0 is an open source online judge system. It accepts source code and stdin over a REST API, executes the code in a sandboxed environment using a tool called `isolate`, and returns stdout, stderr, compile errors, execution time, and memory usage.
+
+The architecture is:
+
+```
+Client → Judge0 API (Rails) → Redis queue → Judge0 Worker → isolate sandbox
+```
+
+`isolate` is the actual sandboxing layer. It uses Linux kernel features — namespaces for process isolation, cgroups for resource limits, seccomp for syscall filtering — to safely execute untrusted code. It was originally built for the IOI (International Olympiad in Informatics) judge.
+
+This matters because `isolate` is tightly coupled to the Linux kernel. Specifically, it requires kernel features that changed in Ubuntu 24. If you try to run Judge0 on Ubuntu 24, `isolate` fails to compile or execute correctly and your submissions silently hang forever.
+
+**First lesson: read the infrastructure requirements before you deploy, not after you spend three hours debugging.**
+
+The fix for BaseCase was downgrading the DigitalOcean droplet from Ubuntu 24 to Ubuntu 22.04. Everything worked immediately after.
+
+---
+
+## The execution API design
+
+Judge0 uses an asynchronous submission model. You do not get results in a single HTTP response. The flow is:
+
+```
+POST /submissions
+  body: { source_code, language_id, stdin }
+  response: { token }
+
+GET /submissions/{token}
+  response: { status, stdout, stderr, compile_output, time, memory }
+```
+
+The status object has numeric IDs:
+
+- 1 = In Queue
+- 2 = Processing
+- 3 = Accepted
+- 4 = Wrong Answer
+- 5 = Time Limit Exceeded
+- 6 = Compilation Error
+- 11 = Runtime Error (and several other runtime error variants)
+
+Your backend needs to poll until `status.id > 2`. Here is what that looks like in practice:
+
+```typescript
+async function pollResult(token: string) {
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+
+    const res = await fetch(
+      `${JUDGE0_URL}/submissions/${token}?base64_encoded=true&fields=stdout,stderr,compile_output,status`,
+    );
+    const result = await res.json();
+
+    if (result.status.id !== 1 && result.status.id !== 2) {
+      return result;
+    }
+  }
+  return null; // timed out
+}
+```
+
+The 1 second delay per poll means a fast submission takes 1-2 seconds (two poll attempts). A slow submission or busy queue can take much longer. Cap your attempts to prevent requests from hanging indefinitely.
+
+---
+
+## Why base64 encoding is non-negotiable
+
+If you send source code as plain text in the request body, you will run into encoding issues. Code contains backslashes, quotes, newlines, null bytes, and non-ASCII characters. JSON serialization handles most of these but not all. Edge cases will corrupt your submissions in ways that are extremely hard to debug.
+
+Judge0 supports base64 encoding for source code, stdin, and all output fields. Use it. Always.
+
+```typescript
+const encodedCode = Buffer.from(code).toString("base64");
+const encodedStdin = Buffer.from(stdin).toString("base64");
+
+// Submit
+body: JSON.stringify({
+  source_code: encodedCode,
+  language_id: languageId,
+  stdin: encodedStdin,
+});
+
+// Decode response
+const decode = (val: string | null) =>
+  val ? Buffer.from(val, "base64").toString("utf-8") : "";
+
+const stdout = decode(result.stdout);
+const stderr = decode(result.stderr);
+```
+
+There is a second encoding problem specific to Windows: browsers on Windows send `\r\n` line endings. Judge0 runs on Linux. When your C++ code reads `cin >> n`, it reads `"8\r"` instead of `"8"`. The carriage return causes `cin` to fail silently — your code compiles, runs, and outputs a wrong answer with no error. This is one of the most confusing bugs you will hit.
+
+Fix: strip carriage returns from stdin before encoding.
+
+```typescript
+const cleanStdin = stdin.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+const encodedStdin = Buffer.from(cleanStdin).toString("base64");
+```
+
+---
+
+## The hardest problem: representing test cases
+
+This is where most tutorials stop and where the real design work begins.
+
+A test case needs to exist in two completely different forms simultaneously.
+
+**The machine form** is what actually gets piped to the program through stdin. For a Two Sum problem it looks like:
+
+```
+4
+2 7 11 15
+9
+```
+
+Line 1 is the array size. Line 2 is the array elements space-separated. Line 3 is the target. This is exactly what `cin >> n` reads.
+
+**The human form** is what makes sense to a user reading a problem statement:
+
+```
+nums = [2,7,11,15], target = 9
+```
+
+These are structurally different. You cannot reliably parse one from the other because every problem has a different input structure. Two Sum reads `n, array, target`. A graph problem reads `nodes, edges, then queries`. A string problem reads a single line. A 2D grid problem reads `rows, cols, then rows lines of data`.
+
+The schema decision in BaseCase:
+
+```prisma
+model TestCase {
+  input          String   // raw stdin: "4\n2 7 11 15\n9"
+  expectedOutput String   // trimmed stdout: "0 1"
+  displayInput   String?  // human readable: "nums = [2,7,11,15], target = 9"
+  displayOutput  String?  // human readable: "[0,1]"
+  visibility     Visibility @default(PUBLIC)
+}
+```
+
+The `input` field is what gets sent to Judge0. The `displayInput` field is what gets shown to the user. They are separate fields, both manually authored, and neither is derived from the other.
+
+This also drives a public/private visibility split. PUBLIC test cases are shown to users as examples, and their details (input, expected, got) are shown on failure. PRIVATE test cases run against the submission but their data never reaches the client — only pass/fail status.
+
+```typescript
+results.push({
+  passed,
+  input: tc.visibility === "PUBLIC" ? tc.displayInput : null,
+  expected: tc.visibility === "PUBLIC" ? tc.displayOutput : null,
+  got: tc.visibility === "PUBLIC" ? stdout : null,
+  status,
+});
+```
+
+This is not optional. If you expose private test case inputs, users will hard-code solutions to pass them. Every production judge does this.
+
+---
+
+## The output comparison problem
+
+Comparing program output sounds trivial. It is not.
+
+Judge0 adds a trailing newline to stdout. If your expected output is `"0 1"` and Judge0 returns `"0 1\n"`, a naive string comparison fails. Always trim both sides before comparing:
+
+```typescript
+const stdout = decode(result.stdout).trim();
+const expected = tc.expectedOutput.trim();
+const passed = stdout === expected;
+```
+
+This alone fixes most false failures.
+
+For more complex output — floating point numbers, multiple valid orderings, 2D arrays — you need custom comparison logic. LeetCode handles this per-problem with custom checkers. For a student project, trimming and exact string matching covers the majority of problems.
+
+---
+
+## Run vs Submit — two different routes for two different purposes
+
+Every coding platform has two separate execution modes. They should be separate API routes.
+
+**Run** — user tests their code against custom input. No test case comparison. Just execute and show output. Fast, cheap, runs one submission.
+
+```
+POST /api/execute
+body: { code, language, stdin }
+response: { stdout, stderr, compile_output, status }
+```
+
+**Submit** — user's code runs against all test cases (public and private). Output is compared against expected output. Returns structured pass/fail results per test case. Slower, more database-intensive, involves a loop over all test cases.
+
+```
+POST /api/submit
+body: { code, language }
+response: {
+  accepted: boolean,
+  passed: number,
+  total: number,
+  results: Array<{ passed, status, input?, expected?, got? }>
+}
+```
+
+The submit route in BaseCase:
+
+```typescript
+for (const tc of problem.testCases) {
+  const result = await runOnJudge0(code, languageId, tc.input);
+
+  const stdout = decode(result.stdout).trim();
+  const passed = stdout === tc.expectedOutput.trim();
+
+  let status = passed ? "Accepted" : "Wrong Answer";
+  if (decode(result.compile_output)) {
+    status = "Compile Error";
+    compileErrored = true;
+  }
+  if (decode(result.stderr)) status = "Runtime Error";
+
+  results.push({
+    passed,
+    input: tc.visibility === "PUBLIC" ? tc.displayInput : null,
+    expected: tc.visibility === "PUBLIC" ? tc.displayOutput : null,
+    got: tc.visibility === "PUBLIC" ? stdout : null,
+    status,
+  });
+
+  if (compileErrored) break; // no point running remaining tests
+}
+```
+
+Note the early exit on compile error. If the code doesn't compile, every subsequent test case would also fail with the same error. Break out of the loop immediately.
+
+---
+
+## Self-hosting vs managed services: the real tradeoff
+
+The question most tutorials skip: where does Judge0 actually run?
+
+**Option 1: Managed/hosted Judge0**
+
+The official Judge0 cloud product starts at €27/month. RapidAPI has a Judge0 API but their free tier was effectively removed by 2026. These options are the easiest to integrate — just an API key and a base URL — but they have per-submission costs and rate limits that matter at scale.
+
+**Option 2: Self-hosted**
+
+Self-hosting gives you unlimited submissions at a flat infrastructure cost. For BaseCase this meant a $12/month DigitalOcean droplet. GitHub Student Pack credit covered this entirely.
+
+The tradeoff: you own the infrastructure. That means OS compatibility issues (Ubuntu 24 vs 22), worker configuration, uptime, Docker management, and no support if something breaks.
+
+For a student project or small platform, self-hosting is the right choice. The cost difference is significant, you control the environment, and the operational burden is manageable for low traffic.
+
+**The deployment setup:**
+
+Judge0 is distributed as a docker-compose file. The stack includes the Judge0 Rails API, a Sidekiq worker process, PostgreSQL (for job metadata), and Redis (for the job queue). You run `docker-compose up -d` and it listens on port 2358.
+
+```
+JUDGE0_URL=http://your-droplet-ip:2358
+```
+
+Your Next.js API routes call this URL server-side. The URL never reaches the browser. Your droplet IP stays private.
+
+---
+
+## Latency: the honest numbers
+
+With self-hosted Judge0 on a $12/month single-core droplet:
+
+- Simple Python hello world: ~2 seconds
+- C++ compile + run: ~2-3 seconds
+- Full submission (5 test cases, sequential): 10-15 seconds
+
+Each test case requires its own submission because Judge0 runs one program per submission. Running 5 test cases means 5 round-trips through the polling loop.
+
+Known optimizations not yet implemented in BaseCase:
+
+**Batched submissions** — Judge0 supports `/submissions/batch` which submits multiple test cases in one request. Reduces round-trips significantly.
+
+**Reduce polling interval** — 1000ms between polls is conservative. 300-500ms would reduce average latency without hammering the worker.
+
+**Parallel polling** — submit all test cases first, then poll all tokens simultaneously rather than sequentially.
+
+**Worker scaling** — Judge0's docker-compose supports multiple worker instances. More workers means more concurrent executions.
+
+For a production system at LeetCode's scale, none of this matters because they run thousands of worker machines. For a student project, accepting higher latency in exchange for lower infrastructure cost is a reasonable engineering tradeoff — as long as you're honest about it.
+
+---
+
+## The browser compatibility problem with code editors
+
+Monaco Editor (the engine behind VS Code) is a browser-only library. It uses `window`, `document`, and browser APIs extensively.
+
+In a Next.js application, components are server-rendered by default. Server rendering runs in Node.js where `window` does not exist. Importing Monaco normally causes an immediate crash:
+
+```
+ReferenceError: window is not defined
+```
+
+The fix is dynamic import with SSR disabled:
+
+```typescript
+const MonacoEditor = dynamic(
+  () => import("@monaco-editor/react").then((m) => m.default),
+  { ssr: false },
+);
+```
+
+This tells Next.js: do not attempt to render this component on the server. Only mount it in the browser after hydration. The `loading` prop handles the brief flash while Monaco downloads:
+
+```tsx
+<MonacoEditor
+  loading={<div>Loading editor...</div>}
+  language={language}
+  value={code}
+  onChange={(val) => setCode(val ?? "")}
+  theme="vs-dark"
+  options={{
+    fontSize: 13,
+    minimap: { enabled: false },
+    fontFamily: "'IBM Plex Mono', monospace",
+  }}
+/>
+```
+
+---
+
+## The API design for progress tracking
+
+Code execution is only half the system. The other half is tracking what users have done.
+
+The core challenge is partial updates. A user might bookmark a problem, update their notes, mark it solved, or change their confidence rating — any one of these independently, at any time. Sending the entire progress state on every update is wasteful and risks overwriting data.
+
+The solution is a PATCH route that builds its update object conditionally based on what fields are present in the request body:
+
+```typescript
+const toUpdate: Partial<UserProblem> = {};
+
+if (typeof body.bookmark === "boolean") toUpdate.bookmark = body.bookmark;
+if (typeof body.solved === "boolean") toUpdate.solved = body.solved;
+if (["LOW", "MEDIUM", "HIGH"].includes(body.confidenceV2))
+  toUpdate.confidenceV2 = body.confidenceV2;
+if (typeof body.notes === "string") toUpdate.notes = body.notes;
+
+if (Object.keys(toUpdate).length === 0) {
+  return NextResponse.json({ error: "No valid fields" }, { status: 400 });
+}
+
+await prisma.userProblem.upsert({
+  where: { userId_problemId: { userId, problemId } },
+  update: toUpdate,
+  create: { userId, problemId, ...toUpdate },
+});
+```
+
+The upsert pattern — create if not exists, update if exists — means you never need to check whether a progress record exists before writing. First interaction creates it. Every subsequent interaction updates it. No null checks, no separate create vs update routes.
+
+---
+
+## Idempotent seeding: why it matters more than you think
+
+A seed script that can only run once on a fresh database is fragile. During development you will reset your database, change your schema, or need to add new problems to an existing database dozens of times.
+
+Making your seed idempotent — safe to run multiple times with the same result — requires two things.
+
+On the API routes the seed calls: use upsert instead of create. A problem upsert on slug means running the seed twice creates the problem once, not twice.
+
+On the seed script itself: check before creating. For test cases, check if any exist for this problem before inserting. For section-problem links, catch the unique constraint violation and treat it as success.
+
+```typescript
+// Try to link. If already linked, skip silently.
+try {
+  await apiRequest(
+    `/api/sheets/${sheetSlug}/section/${sectionId}/problems`,
+    "POST",
+    {
+      problemId: problem.id,
+    },
+  );
+} catch (err: any) {
+  if (err.message?.includes("unique") || err.message?.includes("exists")) {
+    console.log(`  Already linked: ${problem.title}`);
+  } else {
+    throw err;
+  }
+}
+```
+
+An idempotent seed is a first-class engineering artifact — version-controlled, reproducible, and safe to run in any environment. Treat it that way.
+
+---
+
+## What LeetCode does differently at scale
+
+Everything described above is the honest version for a small platform. Here is what production systems do differently:
+
+**Code execution**: LeetCode runs thousands of worker machines with custom sandboxing. Submissions are distributed across workers. Latency is sub-second because there is no queue wait.
+
+**Test case storage**: Test cases are stored as files in object storage (S3-equivalent), not in a relational database. For problems with large inputs this is the only viable approach.
+
+**Output comparison**: Custom checker functions per problem. Floating point problems use epsilon comparison. Problems with multiple valid outputs use set comparison or custom validation logic.
+
+**Language versions**: LeetCode supports 20+ language versions. Each requires a separate execution environment. Docker images per language version, cached and pre-warmed.
+
+**Security**: Multi-layer sandboxing. Judge0's isolate is one approach. LeetCode uses proprietary sandboxing. Both rely on Linux kernel primitives.
+
+**Result caching**: Identical submissions (same code, same problem) can return cached results. Significant at LeetCode's scale, irrelevant at smaller scale.
+
+None of these matter for a student project or early-stage platform. Build the simple version first. Optimize when you have evidence of the bottleneck.
+
+---
+
+## The schema that holds everything together
+
+For reference, the core data model:
+
+```
+User
+  └── UserProblem (progress, confidence, interval, notes)
+       └── Problem
+            ├── TestCase (input, expectedOutput, displayInput, displayOutput, visibility)
+            └── SectionProblem
+                 └── SheetSection
+                      └── Sheet
+```
+
+Key constraints:
+
+- `UserProblem` has a unique index on `(userId, problemId)` — one progress record per user per problem
+- `SectionProblem` has a unique index on `(sectionId, problemId)` — a problem appears in a section once
+- `TestCase` cascades delete from Problem — no orphaned test cases
+
+---
+
+## Summary: what actually matters when you build this
+
+Get the sandboxing right before anything else. Judge0 + Ubuntu 22.04 + correct docker-compose setup is your foundation. Everything else is application code.
+
+Use base64 encoding for all code and IO. Non-negotiable.
+
+Strip Windows line endings from stdin before encoding. You will forget this and lose an hour.
+
+Design your test case schema for two representations from day one. Adding `displayInput` later after you already have 30 problems with only `input` is painful.
+
+Make your submit route return null for private test case details. Build this in from the start.
+
+Build idempotent seeding. It will save you hours of manual database cleanup.
+
+Accept higher latency at small scale. Sequential test case execution with 1 second polling is fine until you have real users with real load.
+
+Deploy to production early. Every production-specific issue — connection pooling, cold starts, Ubuntu compatibility — is invisible in local development.
+
+---
+
+_BaseCase is live at [https://basecase-xi.vercel.app/](https://basecase-xi.vercel.app/) — a DSA practice platform with a self-hosted Judge0 execution engine, Monaco Editor, and spaced repetition built on top._
+
+_Built with Next.js, TypeScript, Prisma, PostgreSQL, and Judge0 (self-hosted on DigitalOcean Ubuntu 22.04)._

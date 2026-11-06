@@ -1,0 +1,393 @@
+I was building a mock interview platform.
+
+The idea was simple: a candidate speaks to an AI interviewer, the AI listens, reasons, and responds — just like a real interview. No typing. No clicking. Just conversation.
+
+The problem was I wanted to build the voice layer myself. No third-party services abstracting the hard parts away. I wanted to understand what was actually happening under the hood.
+
+What followed was one of the most instructive engineering experiences I've had — and also one of the most humbling.
+
+This is a complete breakdown of how real-time AI voice agents work, how to build a working prototype, where the prototype breaks down at scale, and how to fix it.
+
+---
+
+## Part 1 — The Mental Model
+
+Before writing a single line of code, you need to understand what a voice agent actually is at its core.
+
+A voice agent is nothing more than a **pipeline**. Data enters one end as sound waves. It exits the other end as sound waves again. Everything in between is transformation.
+
+```
+User speaks
+    ↓
+Audio captured (browser / microphone)
+    ↓
+Speech converted to text (STT)
+    ↓
+Text sent to AI model
+    ↓
+AI generates response text
+    ↓
+Response text converted to speech (TTS)
+    ↓
+Audio played back to user
+    ↓
+User speaks again
+```
+
+That's it. Six transformations. Each one has a cost — in latency, in accuracy, in complexity. Understanding each transformation independently is the key to building the whole thing well.
+
+The most common mistake engineers make when building voice agents is treating this as one problem. **It is six problems.** Solve them one at a time.
+
+---
+
+## Part 2 — Capturing Audio (The Browser Layer)
+
+In a browser environment, audio capture happens through the **Web Speech API** or the **MediaRecorder API**. They solve different problems.
+
+**Web Speech API** handles both capture and transcription in one step. The browser sends audio to a speech recognition service (usually Google's) and returns a transcript. It's fast, it's straightforward, and it works in Chrome and Edge out of the box.
+
+```javascript
+const recognition = new window.webkitSpeechRecognition();
+recognition.continuous = true;
+recognition.interimResults = true;
+recognition.lang = "en-US";
+
+recognition.onresult = (event) => {
+  const transcript = Array.from(event.results)
+    .map((result) => result[0].transcript)
+    .join("");
+
+  console.log(transcript); // live text as user speaks
+};
+
+recognition.start();
+```
+
+The `interimResults: true` flag is critical — it makes the browser emit partial transcripts in real time as the user speaks, rather than waiting until they stop. This creates the live transcript effect. `continuous: true` keeps recognition going past the first pause until you explicitly stop it.
+
+**What breaks here:** Firefox doesn't support the Web Speech API at all. Brave blocks it by default due to privacy concerns around sending audio to external servers. Safari has partial support. This isn't a bug you can fix — it's a browser policy decision. Handle it by detecting support at runtime and degrading gracefully.
+
+```javascript
+const isSupported =
+  "webkitSpeechRecognition" in window || "SpeechRecognition" in window;
+
+if (!isSupported) {
+  // show fallback — text input or inform user to switch browser
+}
+```
+
+**MediaRecorder API** is lower level. It captures raw audio chunks and hands you binary data. You'd use this if you want to send audio to your own STT service (Whisper, Deepgram, AssemblyAI) rather than relying on the browser's built-in recognition. More control, more complexity, more latency budget consumed.
+
+For a prototype, Web Speech API is the right call. For production at scale, MediaRecorder plus a dedicated STT service gives you more control over accuracy and cross-browser support.
+
+---
+
+## Part 3 — Speech to Text
+
+If you use Web Speech API, STT is handled for you. The browser returns `event.results` as structured transcript data.
+
+If you're rolling your own, you capture audio chunks with MediaRecorder and send them to a transcription service:
+
+```javascript
+const mediaRecorder = new MediaRecorder(stream);
+const chunks = [];
+
+mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+
+mediaRecorder.onstop = async () => {
+  const audioBlob = new Blob(chunks, { type: "audio/webm" });
+  const formData = new FormData();
+  formData.append("audio", audioBlob, "recording.webm");
+
+  const response = await fetch("/api/transcribe", {
+    method: "POST",
+    body: formData,
+  });
+
+  const { transcript } = await response.json();
+  // now send transcript to AI
+};
+```
+
+**The finalization problem:** When the user stops speaking, STT engines need a brief moment to finalize the last few words. If you grab the transcript immediately on stop, you'll often miss the last word or two. The fix is simple — wait 300ms after stopping.
+
+```javascript
+const handleStopRecording = () => {
+  recognition.stop();
+
+  setTimeout(() => {
+    submitTranscript(finalTranscript); // fully finalized now
+  }, 300);
+};
+```
+
+Small detail. Significant impact on perceived accuracy.
+
+---
+
+## Part 4 — The AI Layer
+
+Once you have a transcript, you send it to your AI model. The key design decision here is how you manage conversation history.
+
+A conversational AI has no memory between requests. Every request is stateless. To simulate a continuous conversation, you must send the entire conversation history with every request.
+
+The simplest representation is a flat array of strings — even indices are AI messages, odd indices are user messages. Role is derived from position:
+
+```typescript
+const transcript = [
+  "Hello, welcome to your interview. Tell me about distributed systems.", // AI — index 0
+  "Sure, I've worked on a few distributed caching systems.", // User — index 1
+  "Interesting. Can you describe a specific consistency challenge?", // AI — index 2
+  "We had issues with cache invalidation across nodes...", // User — index 3
+];
+
+const conversationHistory = transcript.map((text, i) => ({
+  role: i % 2 === 0 ? "model" : "user",
+  parts: [{ text }],
+}));
+```
+
+You send this full history to the model on every turn. The model reads the entire conversation and generates the next response in context.
+
+This is the correct architecture for a prototype. The cost is that the context window grows with every turn — eventually hitting token limits and increasing latency for longer conversations. Production systems handle this with sliding window context or summarization. For a prototype, it's not a concern.
+
+---
+
+## Part 5 — Text to Speech
+
+Once the AI generates a response, you convert it to audio. On the server, you call a TTS service with the AI's message and get back base64-encoded audio. On the client, you decode and play it:
+
+```javascript
+const playAudio = (base64AudioString) => {
+  return new Promise((resolve) => {
+    const binaryString = atob(base64AudioString);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+
+    const blob = new Blob([bytes], { type: "audio/wav" });
+    const url = URL.createObjectURL(blob);
+
+    const audio = new Audio(url);
+    audio.onended = () => {
+      URL.revokeObjectURL(url); // always clean up
+      resolve();
+    };
+    audio.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(); // don't block the interview on audio failure
+    };
+
+    audio.play().catch(() => {
+      // autoplay blocked by browser — show manual play button
+    });
+  });
+};
+```
+
+Two things matter here:
+
+The `onended` callback is where you unlock the microphone for the next user turn. The mic should never be available while AI audio is playing — that creates confusion and terrible UX.
+
+**Always revoke your blob URLs.** Every `URL.createObjectURL` call allocates memory. In a long interview session where the AI speaks dozens of times, not revoking those URLs adds up to a meaningful leak.
+
+---
+
+## Part 6 — State Management
+
+The most underrated part of building a voice agent is managing UI state correctly. Voice is inherently sequential — you can't be speaking and listening at the same time. Your state machine needs to enforce this strictly.
+
+```typescript
+type Phase =
+  | "loading" // initializing session
+  | "speaking" // AI audio playing — mic locked
+  | "answering" // waiting for user to start
+  | "recording" // user speaking — STT active
+  | "submitting" // answer sent — waiting for AI
+  | "error" // something failed
+  | "complete"; // session ended
+
+const transitions = {
+  loading: ["speaking"],
+  speaking: ["answering"],
+  answering: ["recording"],
+  recording: ["submitting"],
+  submitting: ["speaking", "complete", "error"],
+  error: ["submitting"],
+  complete: [],
+};
+```
+
+Every UI element reads from this single phase variable. The microphone button only exists during `answering` and `recording`. The AI orb animates differently per phase. The transcript shows different content per phase.
+
+**A single state variable controlling the entire UI is the correct architecture.** Multiple boolean flags (`isListening`, `isPlaying`, `isLoading`) that need to be kept in sync is a path to subtle, hard-to-reproduce bugs.
+
+---
+
+## Part 7 — The Full Request Cycle
+
+Here's how a single turn works end to end in the working prototype:
+
+```
+1. User clicks "Speak"
+   → resetTranscript()
+   → recognition.start()
+   → phase: 'recording'
+
+2. User speaks
+   → STT emits interim results
+   → transcript updates live in UI
+
+3. User clicks "Done"
+   → recognition.stop()
+   → wait 300ms for STT finalization
+   → if transcript empty → warn, stay in 'recording'
+   → phase: 'submitting'
+
+4. PATCH /api/interview/:id/answer { userResponse: transcript }
+   → append user response to transcript store
+   → send full conversation history to AI model
+   → AI generates { message, isComplete }
+   → strip markdown from message
+   → send to TTS → get base64 audio
+   → append AI response to transcript store
+   → return { nextQuestion, audioData, isComplete }
+
+5. Client receives response
+   → add to history
+   → setCurrentMessage(nextQuestion)
+   → phase: 'speaking'
+   → playAudio(audioData)
+
+6. Audio ends
+   → phase: 'answering'
+   → mic unlocks
+   → cycle repeats
+```
+
+This works. It's a complete, functional voice agent. But it has a problem.
+
+---
+
+## Part 8 — The Latency Problem
+
+On step 4, the client is waiting for all of this to happen sequentially:
+
+```
+STT finalization (300ms)
+  + network request to server
+  + AI model inference (1–3 seconds)
+  + TTS conversion (500ms–1.5s)
+  + network response back
+  = 2.5 to 6 seconds of silence
+```
+
+In a real conversation, 3 seconds of silence after you stop speaking feels broken. At 5 seconds it feels like the system crashed.
+
+This is the fundamental tension in voice AI: **the pipeline is sequential by nature, but the user experience demands it feels instantaneous.**
+
+Here's how you fix it, in order of implementation complexity:
+
+### Fix 1 — Stream the AI Response
+
+Instead of waiting for the full AI response before starting TTS, stream the tokens and begin TTS as soon as you have the first complete sentence.
+
+```
+AI streaming output:
+  "That's a good approach..."              → start TTS immediately
+  "...but consider the edge case where..."  → queue next TTS chunk
+  "...the input array is empty."            → queue final chunk
+```
+
+The user starts hearing audio 300–500ms after the AI starts generating, rather than waiting for the full response. This alone cuts perceived latency by 60–70%.
+
+Implementation requires: a streaming AI endpoint, server-sent events or WebSocket to push tokens to the client, client-side sentence detection, and an audio queue to play chunks sequentially without gaps.
+
+### Fix 2 — WebSocket Instead of HTTP
+
+Every HTTP request carries overhead — connection establishment, headers, handshake. For a real-time conversation, this adds up.
+
+```
+HTTP per-turn:  open connection → send → wait → receive → close  (~200–400ms overhead)
+WebSocket:      connection established once at session start
+                send message → receive streamed response (~near-zero overhead)
+```
+
+A persistent WebSocket eliminates per-request connection cost entirely.
+
+### Fix 3 — Parallel TTS and AI
+
+In the sequential prototype, TTS waits for AI to finish. But you can start generating audio for sentence 1 while the AI is still generating sentences 2 and 3:
+
+```
+AI generates sentence 1 → immediately send to TTS
+AI generates sentence 2 → send to TTS (sentence 1 audio ready)
+AI generates sentence 3 → send to TTS (sentence 2 audio ready)
+
+Client plays sentence 1 audio while sentence 2 is still being generated
+```
+
+Audio playback starts within 500–800ms. Subsequent sentences buffer and play without gaps.
+
+### Fix 4 — Edge Deployment
+
+AI inference and TTS processing in a distant data center adds round-trip latency you cannot engineer away. Deploying these calls from edge functions geographically close to your users is the final lever.
+
+For a regional prototype it's a minor concern. For a global product it matters significantly.
+
+---
+
+## Part 9 — The Architecture That Scales
+
+```
+PROTOTYPE:
+Browser → HTTP PATCH → Server → AI (sequential) → TTS (sequential) → HTTP response → Browser
+
+PRODUCTION:
+Browser ←→ WebSocket ←→ Server
+                            ↓
+                     AI streaming tokens
+                            ↓ (first sentence ready)
+                     TTS sentence 1 → audio chunk → WebSocket → Browser plays
+                            ↓ (second sentence ready)
+                     TTS sentence 2 → audio chunk → WebSocket → Browser queues
+                            ↓
+                     ... continues until response complete
+```
+
+The key shift is from a request-response model to a **streaming pipeline model**. Data flows continuously rather than in discrete chunks.
+
+This is the same architecture used by Siri and Alexa. The reason they feel instantaneous is not that the AI is faster — it's that audio starts playing before the AI has finished thinking.
+
+---
+
+## What I Actually Learned
+
+Building this from first principles taught me things I couldn't have learned any other way.
+
+I now understand why every voice AI demo uses streaming — it's not an optimization, it's a **requirement** for the experience to feel natural. I understand why browser compatibility is a first-class engineering concern and not an afterthought. I understand why state management in voice UIs requires a strict state machine rather than a collection of flags.
+
+Most importantly, I understand the difference between a pipeline that _works_ and a pipeline that _feels good_. They are not the same thing.
+
+The prototype works. Every component does what it's supposed to do. But the experience exposes the gap between functional correctness and perceived performance — and closing that gap is an entirely different class of engineering problem.
+
+---
+
+## The Takeaway
+
+If you want to build a voice AI agent:
+
+1. **Build the sequential prototype first.** Get the full pipeline working end to end. Don't optimize prematurely.
+2. **Measure actual latency at each stage.** Know where your time is going before you try to reduce it.
+3. **Add streaming to the AI layer first** — this gives the biggest latency reduction for the least complexity.
+4. **Replace HTTP with WebSockets** if you need sub-second perceived response time.
+5. **Add parallel TTS** only when you need the last 20% of latency reduction.
+
+The sequential prototype is not a failure state. It is the foundation that makes the optimizations meaningful. You cannot stream what you don't understand sequentially first.
+
+**Build the foundation. Then make it fast.**
+
+---
+
+_The voice agent described in this post powers BaseCase's AI Mock Interviewer — live and working. Still making it faster._

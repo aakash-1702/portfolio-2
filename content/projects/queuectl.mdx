@@ -1,0 +1,102 @@
+## The problem
+
+Most background job systems start with a broker: Redis for BullMQ, RabbitMQ, SQS. That is one more process to run, monitor and keep consistent with the database that holds the actual state.
+
+QueueCTL asks a narrower question: **if the jobs already live in Postgres, can Postgres itself be the queue?** It can, as long as two workers can never claim the same row and a crashed worker never loses a job.
+
+---
+
+## Architecture
+
+Everything lives in Postgres: jobs, configuration and worker heartbeats. A CLI enqueues jobs and manages workers; each worker is a separate OS process that polls for work.
+
+```
+queuectl enqueue ──> Job table (Postgres) <── worker 1 ┐
+queuectl status  ──>   Config table          <── worker 2 ├─ forked processes
+queuectl dlq     ──>   Worker table          <── worker 3 ┘   (heartbeat every 5s)
+```
+
+Every job moves through five states, backed by a Prisma enum:
+
+- `pending`: enqueued and waiting to be claimed
+- `processing`: currently executing on a worker
+- `completed`: the command exited with code 0
+- `failed`: failed, but will be retried after a backoff
+- `dead`: exhausted its retries and moved to the dead-letter queue
+
+---
+
+## Claiming jobs without a lock manager
+
+The core of the system is one query. A worker claims the next runnable job and marks it as its own in a single atomic statement:
+
+```sql
+UPDATE "Job"
+SET state = 'processing', "lockedBy" = $workerId, "lockedAt" = NOW(), "updatedAt" = NOW()
+WHERE id = (
+  SELECT id FROM "Job"
+  WHERE state IN ('pending', 'failed')
+    AND "nextRunAt" <= NOW()
+  ORDER BY "nextRunAt" ASC
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, command, attempts, "maxRetries";
+```
+
+`FOR UPDATE` takes a row-level lock on the selected job. `SKIP LOCKED` is what makes it a queue: when several workers poll at the same moment, each one **skips rows another transaction has already locked** instead of waiting on them. No deadlocks, no double execution, and no application-level lock manager or Redis instance.
+
+An index on `(state, nextRunAt)` keeps the inner select cheap as the table grows.
+
+---
+
+## Workers are processes, not threads
+
+Workers are spawned with Node's `child_process.fork()`. Separate OS processes mean a catastrophic job failure, like a native segfault or an out-of-memory crash, takes down one worker, not the CLI or its siblings.
+
+---
+
+## Retries with exponential backoff
+
+A failed job is not retried immediately. The worker increments `attempts` and schedules `nextRunAt` using:
+
+```
+delay = backoffBase ^ attempts   (seconds)
+```
+
+Once `attempts` reaches `maxRetries`, the job moves to `dead`. `queuectl dlq list` shows dead jobs and `queuectl dlq retry <id>` re-queues one with `attempts` reset to 0, on the assumption that a human fixed the underlying problem and it deserves a fresh retry cycle. Both `max-retries` and `backoff-base` can be changed at runtime with `queuectl config set`.
+
+---
+
+## Graceful shutdown on every OS
+
+Stopping workers without abandoning in-flight jobs turned out to be the hardest part, because **Windows does not deliver POSIX signals gracefully**: `process.kill(pid, 'SIGTERM')` on Windows just hard-kills the process. I found this while testing on Windows, so shutdown uses three channels:
+
+1. **DB signal** (used by `queuectl worker stop`): the CLI writes `status = 'stopping'` to the worker's row. The worker's heartbeat loop sees it within 5 seconds, finishes its current job and exits.
+2. **IPC message** (used by the test suite): when the parent still holds the child, it sends `{ type: 'shutdown' }` over Node's IPC channel.
+3. **SIGTERM** (fallback): a normal signal handler for manual termination on Unix-like systems.
+
+---
+
+## Testing with real processes
+
+The end-to-end suite uses real subprocesses and real database transactions: no mocks. It resets the database first, so it is safe to run repeatedly, and covers five scenarios:
+
+1. **Basic success**: enqueue, start a worker, poll to completion, verify a clean shutdown.
+2. **Retry → DLQ**: a job that always fails lands in the dead-letter queue after `maxRetries`.
+3. **Invalid command**: a garbage shell command fails the job, and the worker survives and moves on.
+4. **Concurrency & locking**: 3 workers against 10 jobs, proving `SKIP LOCKED` prevents duplicate execution.
+5. **Hard crash**: a worker is killed with `SIGKILL`; the job survives in the database and a new worker completes it after recovery.
+
+---
+
+## Trade-offs I chose on purpose
+
+- **Duplicate job IDs are rejected**, not overwritten, so two systems enqueueing the same task can't silently lose data.
+- **Simple polling.** Workers poll every second and heartbeat every five, a deliberate middle ground between responsiveness and database load instead of long-polling.
+- **Direct connections, no pgBouncer.** Workers are few and long-lived, so the connection count stays low.
+- **Postgres over SQLite.** SQLite is simpler for a CLI, but Postgres's `SKIP LOCKED` behaviour is far more predictable under concurrent workers, and Neon makes setup zero-config.
+
+## What's next
+
+Jobs stuck in `processing` after a `SIGKILL` currently need a manual reset (scenario 5 demonstrates this). The natural next step is a **stale-lock sweeper** that reclaims jobs whose `lockedAt` is older than a timeout and whose worker has stopped heartbeating.

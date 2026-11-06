@@ -1,0 +1,261 @@
+## Problem Definition
+
+Most interview prep tools are either too simple (a spreadsheet of problems) or too scattered (dozens of tabs, no continuity). And none of them simulate the actual experience of being interviewed — or give you a real coding environment to practice in.
+
+BaseCase solves three distinct problems: **making DSA practice structured and retention-focused**, **providing a real in-browser IDE with actual code execution**, and **simulating real interview pressure through a live AI voice agent**.
+
+---
+
+## Architecture Overview
+
+The system follows a full-stack architecture built on Next.js App Router:
+
+- **Frontend**: Next.js App Router with React Server Components and Client Components
+- **Backend**: Next.js API routes with Prisma ORM
+- **Database**: PostgreSQL (hosted on Neon)
+- **Code Execution**: Judge0 CE (self-hosted on DigitalOcean)
+- **Editor**: Monaco Editor (same engine as VS Code)
+- **Session store**: Redis (conversation history for the voice agent)
+- **Deployment**: Vercel (app) + DigitalOcean (Judge0)
+
+```
+┌─────────────────────────────────────────────┐
+│                Next.js App                  │
+│  ┌──────────────┬──────────────────────┐    │
+│  │  RSC Pages   │     API Routes       │    │
+│  │  (read path) │  (write/exec path)   │    │
+│  └──────┬───────┴──────┬───────────────┘    │
+│         │              │                    │
+│  ┌──────v──────────────v──────────────┐     │
+│  │          Prisma Client             │     │
+│  └──────────────┬─────────────────────┘     │
+└─────────────────┼───────────────────────────┘
+                  │
+         ┌────────v────────┐
+         │   PostgreSQL    │
+         └─────────────────┘
+
+Code Execution Path:
+Browser → /api/execute or /api/submit
+       → Judge0 (self-hosted, DigitalOcean Ubuntu 22.04)
+       → polling loop → decoded result → client
+```
+
+---
+
+## Feature 1 — Structured DSA Practice
+
+The DSA layer treats practice as a **relational data problem**. The hierarchy is:
+
+### Sheet → Section → Problem → TestCase
+
+- A **Sheet** is a complete study track (e.g., "Blind 75", "NeetCode 150", "Grind 75")
+- A **Section** groups problems by technique (e.g., "Two Pointers", "Sliding Window")
+- A **Problem** is an individual DSA problem with metadata, editorial, hints, and input format
+- A **TestCase** is a test case belonging to a problem, with public/private visibility
+
+The TestCase model stores two distinct representations of the same data — a design decision that turned out to be one of the hardest parts of the system:
+
+```prisma
+model TestCase {
+  id             String            @id @default(cuid())
+  problemId      String
+  input          String            // raw stdin piped to Judge0: "4\n2 7 11 15\n9"
+  expectedOutput String            // trimmed expected stdout: "0 1"
+  displayInput   String?           // human-readable: "nums = [2,7,11,15], target = 9"
+  displayOutput  String?           // human-readable: "[0,1]"
+  visibility     ExampleVisibility @default(PUBLIC)
+  order          Int               @default(0)
+  problem        Problem           @relation(..., onDelete: Cascade)
+}
+```
+
+The separation between `input` and `displayInput` exists because competitive programming judges pipe raw stdin — just numbers line by line — while users read problem statements in natural language. You cannot reliably parse one from the other. Every problem has a different structure. This required manually authoring both representations for every test case across 30+ problems.
+
+---
+
+## Feature 2 — In-Browser IDE with Code Execution
+
+The problem page now includes a full IDE experience — not a redirect to LeetCode.
+
+### Monaco Editor
+
+Monaco (the engine behind VS Code) is integrated via `@monaco-editor/react`. Because Monaco relies on `window` and `document` internally, it cannot be server-rendered. It is loaded via Next.js dynamic import with `ssr: false`.
+
+```typescript
+const MonacoEditor = dynamic(
+  () => import("@monaco-editor/react").then(m => m.default),
+  { ssr: false }
+);
+```
+
+Language switching (C++, Java, Python) updates Monaco's syntax highlighting in real time via a controlled `language` prop. The editor value is held in React state and sent to the execution route on Run or Submit.
+
+### Self-hosted Judge0
+
+Every hosted code execution API was either shut down or paywalled by 2026. Judge0 is self-hosted on a DigitalOcean droplet funded by the GitHub Student Developer Pack ($200 credit).
+
+Key infrastructure decision: Judge0's `isolate` sandbox — the component responsible for actually sandboxing code execution — does not compile correctly on Ubuntu 24's kernel. This caused every submission to hang indefinitely. The fix was downgrading the droplet to Ubuntu 22.04.
+
+### Execution Pipeline
+
+```
+User clicks Run
+  → POST /api/problems/[slug]/problem/execute
+  → base64 encode source_code + stdin (handles special chars, \r\n)
+  → POST /submissions to Judge0 → receive token
+  → poll GET /submissions/[token] every 1s until status.id > 2
+  → base64 decode stdout, stderr, compile_output
+  → return to client
+```
+
+Status codes 1 (In Queue) and 2 (Processing) mean execution is still running. Anything else means done. The polling loop caps at 10 attempts to prevent infinite waits.
+
+Windows browsers send `\r\n` line endings. Judge0 runs on Linux. `cin` reading `"8\r"` instead of `"8"` caused silent failures — correct exit code, wrong output. All stdin is normalized to `\n` before base64 encoding.
+
+### Submission vs Execution
+
+Two separate routes serve different purposes:
+
+`/api/execute` — runs code against custom user-provided stdin. Returns raw stdout. No test case comparison. Used by the Run button.
+
+`/api/submit` — fetches ALL test cases (public + private) from the database, runs each through Judge0, compares trimmed stdout against `expectedOutput`, returns structured results. Private test case details (input, expected, got) are never sent to the client — only pass/fail status.
+
+```typescript
+results.push({
+  passed,
+  input:    tc.visibility === "PUBLIC" ? tc.displayInput    : null,
+  expected: tc.visibility === "PUBLIC" ? tc.displayOutput   : null,
+  got:      tc.visibility === "PUBLIC" ? stdout             : null,
+  status,
+});
+```
+
+---
+
+## Feature 3 — SM-2 Spaced Repetition
+
+BaseCase uses an **SM-2 inspired revision engine** to decide when to resurface previously solved problems. Each problem gets a review interval adjusted by confidence rating and perceived difficulty.
+
+After every solve the post-solve dialog collects:
+
+- **Perceived difficulty** (Too Easy → Very Hard) stored as `problemHardness` (1–5)
+- **Confidence level** (Low / Medium / High) stored as `confidenceV2`
+- **Key insight** — appended to the problem's notes with double line gap
+
+The interval and next review date are calculated on the PATCH route:
+
+```typescript
+if (confidenceV2 === "HIGH") {
+  interval = existing.interval * 2;
+  nextAttempt = now + interval days;
+} else if (confidenceV2 === "MEDIUM") {
+  interval = Math.round(existing.interval * 1.5);
+  nextAttempt = now + interval days;
+} else {
+  interval = 1;
+  revision = 0;
+  nextAttempt = tomorrow;
+}
+```
+
+The PATCH route handles partial updates — only fields present in the request body are written to the database. A bookmark change sends only `{ bookmark: true }`. A confidence change sends only `{ confidenceV2: "HIGH" }`. Nothing else is touched.
+
+---
+
+## Feature 4 — AI Mentor
+
+Each problem page has a persistent AI mentor backed by Gemini. Conversation history is stored per user per problem in the database and restored on page load.
+
+The mentor is contextually aware — it knows the problem title, difficulty, and tags. Proactive triggers are planned: stuck detection (10 minutes, no run attempts), wrong answer detection (auto-suggest help after failed run), and post-solve analysis generation.
+
+For non-premium users the mentor is paywalled with a preview of a sample conversation.
+
+---
+
+## Feature 5 — AI Mock Interviewer (Voice Agent)
+
+The centerpiece of the interview feature is a **real-time AI voice interviewer** built from first principles.
+
+```
+User speaks → STT (Web Speech API) → transcript
+      → PATCH /api/interview/:id/answer
+          → full conversation history sent to AI model
+          → AI generates { message, isComplete }
+          → TTS converts response to base64 audio
+          → response returned to client
+      → client plays audio → mic unlocks for next turn
+```
+
+**State machine:** The client enforces strict phase transitions — `loading → speaking → answering → recording → submitting` — preventing invalid states like the mic being active while AI audio plays.
+
+**Conversation memory:** A flat array of alternating strings stored in Redis. Even indices are AI messages, odd indices are user messages. The full array is sent with every request.
+
+**Browser compatibility:** Web Speech API works in Chrome and Edge. Firefox and Brave fall back to text input.
+
+---
+
+## Data Seeding
+
+All problems, test cases, sheets, and sections are seeded via an idempotent seed script that calls the platform's own API routes. Idempotency is achieved by:
+
+- Using `prisma.upsert()` on all POST routes the seed calls (problem creation, sheet creation)
+- Checking for existing test cases before inserting — skip if present
+- Wrapping section-problem links in try/catch to handle unique constraint violations silently
+- All API routes the seed calls accept an `x-seed-key` header to bypass session auth
+
+Running `npm run seed` on an existing database produces the same result as running it on an empty one.
+
+---
+
+## Latency Architecture
+
+Judge0 execution adds 2–4 seconds per test case due to the polling loop and single-droplet hosting. A full submission across 5 test cases takes 10–15 seconds. Known optimizations not yet implemented:
+
+1. **Reduce polling interval** from 1000ms to 500ms for faster result detection
+2. **Batched submissions** — Judge0 supports submitting multiple test cases in one request
+3. **Droplet upgrade** — 2 vCPU / 4GB RAM would roughly double worker throughput
+4. **Stream partial results** — return each test case result as it completes rather than waiting for all
+
+---
+
+## State Synchronization
+
+The frontend uses optimistic updates for DSA progress: UI reflects the change immediately, API fires in the background, and on failure the UI reverts with an error toast. The `isDirty` flag (JSON comparison of current vs committed progress state) drives Save button visibility.
+
+---
+
+## Schema Design Decisions
+
+**TestCase cascade delete** — `onDelete: Cascade` on the Problem relation ensures test cases are cleaned up when a problem is deleted. No orphaned records.
+
+**UserProblem upsert pattern** — progress records are always upserted, never just created. A user visiting a problem for the first time and clicking bookmark should not fail because no UserProblem record exists yet.
+
+**ExampleVisibility enum** — PUBLIC test cases are shown to users as examples in the problem statement and their details are returned on submission failure. PRIVATE test cases run against the submission but their input/expected/output is never sent to the client.
+
+**Partial PATCH updates** — the progress PATCH route builds a `toUpdate` object conditionally. Only fields present in the request body are included. An empty `toUpdate` returns 400 rather than making a no-op database call.
+
+---
+
+## Scaling Considerations
+
+- **Query optimization**: Composite indices on `(userId, problemId)` for progress lookups
+- **Connection pooling**: Prisma with Neon serverless driver for cold start management
+- **Caching strategy**: Static generation for problem listings, dynamic for progress and submission data
+- **Judge0 scaling**: Worker count configurable via docker-compose environment variable
+
+---
+
+## Lessons Learned
+
+1. **Two representations of the same data is sometimes correct.** The `input` vs `displayInput` split on TestCase looks redundant but is the only clean solution when the machine format and human format are structurally different.
+
+2. **Infrastructure compatibility is a real problem.** Judge0 silently fails on Ubuntu 24. The error wasn't obvious — submissions just hung. Lesson: read the GitHub issues before assuming the problem is your code.
+
+3. **Idempotent seeds are worth the extra work.** Being able to re-run the seed on a live database without fear saved hours of manual database cleanup during development.
+
+4. **Prisma client lags behind schema migrations.** The column can exist in PostgreSQL and show in Prisma Studio while the generated client still rejects it. Always run `prisma generate` after migrations before testing.
+
+5. **Partial updates require discipline on both sides.** The frontend must send only changed fields. The backend must conditionally build the update object. Getting this wrong in either direction causes subtle bugs — either unnecessary writes or fields being silently ignored.
+
+6. **Deploy to production early.** Connection pooling, cold starts, and migration ordering are invisible in local development.
